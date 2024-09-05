@@ -19,8 +19,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Setting page configuration
-st.set_page_config(page_title='Comprehensive Email Harvester', page_icon='⚒️', layout="wide", initial_sidebar_state="auto")
-st.title("⚒️ Comprehensive Email Harvester")
+st.set_page_config(page_title='Comprehensive Email Harvester', page_icon='🥷', layout="wide", initial_sidebar_state="auto")
+st.title("🥷 Comprehensive Email Harvester")
 
 # Initialize session state
 if 'urls' not in st.session_state:
