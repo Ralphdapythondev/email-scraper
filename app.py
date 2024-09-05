@@ -34,22 +34,33 @@ class AnonymityLevel(enum.IntEnum):
 # Proxy Scanner Class
 class ProxyScanner:
     def __init__(self):
-        self.db_conn = sqlite3.connect('proxy_database.db', check_same_thread=False)
+        # Ensure the database is created in a known writable directory
+        self.db_conn = sqlite3.connect('/mnt/data/proxy_database.db', check_same_thread=False)
         self.initialize_db()
         self.blacklisted_proxies = set()
 
     def initialize_db(self):
-        cursor = self.db_conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS proxies (
-                          id INTEGER PRIMARY KEY,
-                          ip TEXT,
-                          port INTEGER,
-                          anonymity_level INTEGER,
-                          last_checked TIMESTAMP
-                          )''')
-        self.db_conn.commit()
+        """Initializes the SQLite database to store proxy information."""
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS proxies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    anonymity_level INTEGER,
+                    last_checked TIMESTAMP
+                )
+            ''')
+            self.db_conn.commit()
+            logging.info("Database initialized successfully.")
+        except sqlite3.Error as e:
+            logging.error(f"Error initializing the database: {e}")
+            raise
 
-    # Method to fetch proxies, validate them, and remove bad proxies...
+    def fetch_proxies(self):
+        # Placeholder for proxy fetching logic.
+        return []
 
 # Email Harvester Class
 class EmailHarvester:
@@ -67,9 +78,10 @@ class EmailHarvester:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def fetch_url_with_proxy(self, url, max_depth):
-        # If proxy usage is enabled, use proxy rotation, otherwise make a regular request
         if self.use_proxies:
-            # Get proxy from proxy scanner, make async request, and handle retries...
+            # If proxy usage is enabled, implement proxy rotation
+            proxies = self.proxy_scanner.fetch_proxies()
+            # Add logic to make a request using the proxies...
             pass
         else:
             async with self.session.get(url) as response:
@@ -96,11 +108,10 @@ def scheduled_scraping():
 
 async def run_scheduled_harvest(harvester):
     await harvester.initialize()
-    # Define the URLs to be scraped (from saved data, etc.)
     urls = st.session_state.urls
     emails = await harvester.harvest_emails(urls)
     await harvester.close()
-    # Log and store the harvested emails
+    logging.info(f"Scheduled scraping found {len(emails)} unique emails.")
 
 # Main Streamlit App Logic
 def main():
