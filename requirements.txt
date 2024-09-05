@@ -7,3 +7,4 @@ tenacity==8.2.2
 aiosqlite==0.19.0
 pytz==2023.3
 python-dateutil==2.8.2
+sqlite3==3.41.2
