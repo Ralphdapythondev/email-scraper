@@ -11,166 +11,262 @@ from urllib.parse import urljoin, urlparse
 import json
 from datetime import datetime, timedelta
 import dns.resolver
-import aiohttp_socks
 import logging
+import sqlite3
+from tenacity import retry, stop_after_attempt, wait_exponential
+import enum
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress debug logs from asyncio
+logging.getLogger('asyncio').setLevel(logging.WARNING)
+
 # Setting page configuration
-st.set_page_config(page_title='Comprehensive Email Harvester', page_icon='🥷', layout="wide", initial_sidebar_state="auto")
-st.title("🥷 Comprehensive Email Harvester")
+st.set_page_config(page_title='Enhanced Email Harvester', page_icon='⚒️', layout="wide", initial_sidebar_state="auto")
+st.title("⚒️ Enhanced Email Harvester with Proxy Support")
 
-# Initialize session state
-if 'urls' not in st.session_state:
-    st.session_state.urls = []
-if 'results_cache' not in st.session_state:
-    st.session_state.results_cache = {}
-
-# User agents for rotation
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+# Proxy sources
+PROXY_SOURCES = [
+    "https://www.proxy-list.download/api/v1/get?type=https",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://www.sslproxies.org/",
+    "https://free-proxy-list.net/",
+    "https://www.us-proxy.org/",
+    "https://free-proxy-list.net/uk-proxy.html",
+    "https://www.socks-proxy.net/",
+    "https://yakumo.rei.my.id/ALL",
+    "https://yakumo.rei.my.id/pALL",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/archive/txt/proxies.txt"
 ]
 
-def validate_and_format_url(url):
-    """Ensure the URL starts with http:// or https://, otherwise prepend https://."""
-    if not url.startswith(("http://", "https://")):
-        return "https://" + url
-    return url
+class AnonymityLevel(enum.IntEnum):
+    TRANSPARENT = 1
+    ANONYMOUS = 2
+    ELITE = 3
 
-def is_valid_email(email):
-    """Check if an email address is valid using regex and DNS MX record check."""
-    pattern = r'''(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])'''
-    if not re.match(pattern, email, re.IGNORECASE):
-        return False
-    
-    domain = email.split('@')[1]
-    try:
-        dns.resolver.resolve(domain, 'MX')
-        return True
-    except:
-        return False
+class ProxyScanner:
+    def __init__(self):
+        self.db_conn = sqlite3.connect('proxy_database.db')
+        self.initialize_db()
+        self.blacklisted_proxies = set()
 
-async def fetch_url_with_proxy(session, url, proxy, depth=0, max_depth=2):
-    """Fetch a URL using a proxy and return its content."""
-    if depth > max_depth:
-        return []
+    def initialize_db(self):
+        with self.db_conn:
+            c = self.db_conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS proxies
+                        (proxy TEXT PRIMARY KEY, latency REAL, country TEXT, city TEXT,
+                        last_checked TIMESTAMP, successful_checks INTEGER, total_checks INTEGER,
+                        anonymity_level INTEGER, isp TEXT)''')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_country ON proxies(country)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_latency ON proxies(latency)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_anonymity ON proxies(anonymity_level)')
+            self.db_conn.execute('PRAGMA synchronous = OFF')
 
-    try:
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        async with session.get(url, headers=headers, proxy=proxy) as response:
-            content = await response.text()
-            soup = BeautifulSoup(content, 'html.parser')
-            emails = set(re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', content))
-            valid_emails = [email for email in emails if await asyncio.to_thread(is_valid_email, email)]
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def fetch_proxies(self) -> set:
+        proxies = set()
+        async with aiohttp.ClientSession() as session:
+            for url in PROXY_SOURCES:
+                try:
+                    async with session.get(url, timeout=30) as response:
+                        if response.status == 200:
+                            text = await response.text()
+                            proxies.update(text.splitlines())
+                            logger.info(f"Fetched {len(text.splitlines())} proxies from {url}")
+                        else:
+                            logger.warning(f"Failed to fetch proxies from {url} with status code {response.status}")
+                except Exception as e:
+                    logger.error(f"Error fetching from {url}: {e}")
+        return proxies
 
-            # Recursively crawl links
-            links = soup.find_all('a', href=True)
-            tasks = []
-            for link in links[:5]:  # Limit to 5 links per page to avoid overloading
-                href = link['href']
-                full_url = urljoin(url, href)
-                if urlparse(full_url).netloc == urlparse(url).netloc:
-                    tasks.append(fetch_url_with_proxy(session, full_url, proxy, depth + 1, max_depth))
-            
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                valid_emails.extend(result)
+    async def check_proxy(self, proxy: str) -> dict:
+        async with aiohttp.ClientSession() as session:
+            try:
+                start_time = time.time()
+                async with session.get("http://httpbin.org/ip", proxy=f"http://{proxy}", timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        ip = data['origin'].split(',')[0].strip()
+                        latency = time.time() - start_time
+                        anonymity_level = await self.check_anonymity_level(proxy)
+                        logger.info(f"Proxy {proxy} passed with latency {latency:.2f} seconds")
+                        return {
+                            'proxy': proxy,
+                            'latency': latency,
+                            'ip': ip,
+                            'anonymity_level': anonymity_level
+                        }
+                    else:
+                        logger.warning(f"Proxy {proxy} failed with status code {response.status}")
+            except Exception as e:
+                logger.debug(f"Proxy {proxy} failed: {e}")
+        return None
 
-            return list(set(valid_emails))
-    except Exception as e:
-        logger.error(f"Error fetching {url}: {str(e)}")
-        return []
+    async def check_anonymity_level(self, proxy: str) -> AnonymityLevel:
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get("http://httpbin.org/headers", proxy=f"http://{proxy}", timeout=10) as response:
+                    if response.status == 200:
+                        headers = await response.json()
+                        if 'X-Forwarded-For' not in headers['headers']:
+                            return AnonymityLevel.ELITE
+                        elif proxy.split(':')[0] not in headers['headers'].get('X-Forwarded-For', ''):
+                            return AnonymityLevel.ANONYMOUS
+                        else:
+                            return AnonymityLevel.TRANSPARENT
+            except Exception:
+                pass
+        return AnonymityLevel.TRANSPARENT
 
-async def scrape_emails_from_urls(urls, proxies, max_depth, rate_limit):
-    """Scrape emails from multiple URLs asynchronously using proxies."""
-    connector = aiohttp_socks.ProxyConnector.from_url(random.choice(proxies))
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = []
-        for url in urls:
-            task = asyncio.ensure_future(fetch_url_with_proxy(session, url, random.choice(proxies), max_depth=max_depth))
-            tasks.append(task)
-            await asyncio.sleep(1 / rate_limit)  # Rate limiting
-        results = await asyncio.gather(*tasks)
-    return [email for sublist in results for email in sublist]
+    def update_proxy_database(self, result: dict):
+        try:
+            with self.db_conn:
+                c = self.db_conn.cursor()
+                c.execute('''INSERT OR REPLACE INTO proxies
+                            (proxy, latency, last_checked, successful_checks, total_checks, anonymity_level)
+                            VALUES (?, ?, ?,
+                                    COALESCE((SELECT successful_checks FROM proxies WHERE proxy = ?) + 1, 1),
+                                    COALESCE((SELECT total_checks FROM proxies WHERE proxy = ?) + 1, 1),
+                                    ?)''',
+                          (result['proxy'],
+                           result['latency'],
+                           datetime.now().isoformat(),
+                           result['proxy'],
+                           result['proxy'],
+                           result['anonymity_level'].value))
+                logger.info(f"Updated database with proxy: {result['proxy']}")
+        except sqlite3.Error as e:
+            logger.error(f"An error occurred while updating the database: {e}")
+            logger.error(f"Result data: {result}")
 
-# Streamlit interface
-st.sidebar.title("⚙️ Configuration")
-max_depth = st.sidebar.slider("Max Crawl Depth", 0, 5, 2)
-rate_limit = st.sidebar.number_input("Rate Limit (requests per second)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-proxy_input = st.sidebar.text_area("Enter proxy servers (one per line, format: protocol://ip:port)", value="http://localhost:8080")
+    def get_proxies(self, min_anonymity: AnonymityLevel = AnonymityLevel.ANONYMOUS, max_latency: float = 5.0) -> list:
+        c = self.db_conn.cursor()
+        query = '''SELECT proxy FROM proxies 
+                   WHERE anonymity_level >= ? AND latency <= ? AND last_checked >= ?
+                   ORDER BY (successful_checks * 1.0 / total_checks) DESC, latency ASC'''
+        c.execute(query, (min_anonymity.value, max_latency, (datetime.now() - timedelta(days=1)).isoformat()))
+        return [row[0] for row in c.fetchall() if row[0] not in self.blacklisted_proxies]
 
-urls_input = st.text_area("Enter URLs to scrape emails from (one per line)")
+class EmailHarvester:
+    def __init__(self):
+        self.proxy_scanner = ProxyScanner()
+        self.session = None
 
-if st.button("Start Scraping"):
-    st.session_state.urls = [validate_and_format_url(url.strip()) for url in urls_input.splitlines() if url.strip()]
-    proxies = [proxy.strip() for proxy in proxy_input.splitlines() if proxy.strip()]
-    
-    # Check cache and filter out recently scraped URLs
-    current_time = datetime.now()
-    urls_to_scrape = []
-    for url in st.session_state.urls:
-        if url in st.session_state.results_cache:
-            cache_time, _ = st.session_state.results_cache[url]
-            if current_time - cache_time < timedelta(hours=1):  # Cache for 1 hour
-                st.info(f"Using cached results for {url}")
-                continue
-        urls_to_scrape.append(url)
-    
-    if urls_to_scrape:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    async def initialize(self):
+        await self.refresh_proxies()
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def refresh_proxies(self):
+        proxies = await self.proxy_scanner.fetch_proxies()
+        for proxy in proxies:
+            result = await self.proxy_scanner.check_proxy(proxy)
+            if result:
+                self.proxy_scanner.update_proxy_database(result)
+
+    async def get_random_proxy(self):
+        proxies = self.proxy_scanner.get_proxies()
+        return random.choice(proxies) if proxies else None
+
+    async def fetch_url_with_proxy(self, url: str, depth: int = 0, max_depth: int = 2) -> list:
+        if depth > max_depth:
+            return []
+
+        proxy = await self.get_random_proxy()
+        if not proxy:
+            logger.warning("No valid proxies available.")
+            return []
 
         try:
-            all_emails = asyncio.run(scrape_emails_from_urls(urls_to_scrape, proxies, max_depth, rate_limit))
+            async with self.session.get(url, proxy=f"http://{proxy}", timeout=30) as response:
+                if response.status == 200:
+                    content = await response.text()
+                    soup = BeautifulSoup(content, 'html.parser')
+                    emails = set(re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', content))
+                    valid_emails = [email for email in emails if await self.is_valid_email(email)]
 
-            # Update cache
-            for url in urls_to_scrape:
-                st.session_state.results_cache[url] = (current_time, all_emails)
+                    # Recursively crawl links
+                    links = soup.find_all('a', href=True)
+                    tasks = []
+                    for link in links[:5]:  # Limit to 5 links per page to avoid overloading
+                        href = link['href']
+                        full_url = urljoin(url, href)
+                        if urlparse(full_url).netloc == urlparse(url).netloc:
+                            tasks.append(self.fetch_url_with_proxy(full_url, depth + 1, max_depth))
+                    
+                    results = await asyncio.gather(*tasks)
+                    for result in results:
+                        valid_emails.extend(result)
 
-            st.write(f"Found {len(all_emails)} unique emails.")
-            
-            if all_emails:
-                email_df = pd.DataFrame(all_emails, columns=["Email"])
-                st.write(email_df)
-
-                # Export options
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    csv_data = email_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(label="Download as CSV", data=csv_data, file_name='emails.csv', mime='text/csv')
-                with col2:
-                    excel_data = BytesIO()
-                    email_df.to_excel(excel_data, index=False)
-                    excel_data.seek(0)
-                    st.download_button(label="Download as Excel", data=excel_data, file_name='emails.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-                with col3:
-                    json_data = email_df.to_json(orient='records')
-                    st.download_button(label="Download as JSON", data=json_data, file_name='emails.json', mime='application/json')
+                    return list(set(valid_emails))
+                else:
+                    logger.warning(f"Failed to fetch {url} with status code {response.status}")
+                    return []
         except Exception as e:
-            st.error(f"An error occurred during scraping: {str(e)}")
-            logger.exception("Scraping error")
+            logger.error(f"Error fetching {url}: {str(e)}")
+            self.proxy_scanner.blacklisted_proxies.add(proxy)
+            return []
 
-# Feedback form using Formspree
-st.sidebar.title("Feedback")
-with st.sidebar.form(key='feedback_form'):
-    feedback_text = st.text_area("Submit your feedback or report an issue")
-    submit_button = st.form_submit_button(label='Submit Feedback')
+    async def is_valid_email(self, email: str) -> bool:
+        pattern = r'''(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])'''
+        if not re.match(pattern, email, re.IGNORECASE):
+            return False
+        
+        domain = email.split('@')[1]
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, dns.resolver.resolve, domain, 'MX')
+            return True
+        except:
+            return False
 
-    if submit_button:
-        response = aiohttp.ClientSession().post(
-            'https://formspree.io/f/manwkbny',
-            data={'message': feedback_text}
-        )
-        if response.ok:
-            st.success("Thank you for your feedback! It has been sent successfully.")
+    async def harvest_emails(self, urls: list, max_depth: int = 2) -> list:
+        all_emails = []
+        for url in urls:
+            emails = await self.fetch_url_with_proxy(url, max_depth=max_depth)
+            all_emails.extend(emails)
+        return list(set(all_emails))
+
+async def main():
+    harvester = EmailHarvester()
+    await harvester.initialize()
+
+    st.write("Enter URLs to scrape emails from (one per line):")
+    urls_input = st.text_area("URLs")
+    max_depth = st.slider("Max Crawl Depth", 0, 5, 2)
+
+    if st.button("Start Harvesting"):
+        urls = [url.strip() for url in urls_input.splitlines() if url.strip()]
+        if urls:
+            with st.spinner('Harvesting emails...'):
+                emails = await harvester.harvest_emails(urls, max_depth)
+                if emails:
+                    st.write(f"Found {len(emails)} unique emails:")
+                    email_df = pd.DataFrame(emails, columns=["Email"])
+                    st.write(email_df)
+
+                    # Export options
+                    csv = email_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="Download as CSV",
+                        data=csv,
+                        file_name="harvested_emails.csv",
+                        mime="text/csv"
+                    )
+                else:
+                    st.write("No emails found.")
         else:
-            st.error("There was an issue sending your feedback. Please try again later.")
+            st.write("Please enter at least one URL.")
 
-# Display current session state and cache info
-st.sidebar.title("Debug Information")
-st.sidebar.write("Current URLs in session:", st.session_state.urls)
-st.sidebar.write("Cache size:", len(st.session_state.results_cache))
+    await harvester.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
