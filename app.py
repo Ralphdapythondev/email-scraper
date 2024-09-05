@@ -70,14 +70,21 @@ if st.button("Start Scraping"):
         excel_data.seek(0)
         st.download_button(label="Download as Excel", data=excel_data, file_name='emails.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-# Feedback form
+# Feedback form using Formspree
 st.sidebar.title("Feedback")
-feedback_text = st.sidebar.text_area("Submit your feedback or report an issue")
-if st.sidebar.button("Submit Feedback"):
-    st.sidebar.success("Thank you for your feedback!")
-    # Here you would typically send this feedback to a database or email
-    # For now, we'll just print it to the Streamlit app
-    st.sidebar.write("Feedback received:", feedback_text)
+with st.sidebar.form(key='feedback_form'):
+    feedback_text = st.text_area("Submit your feedback or report an issue")
+    submit_button = st.form_submit_button(label='Submit Feedback')
+
+    if submit_button:
+        response = requests.post(
+            'https://formspree.io/f/manwkbny',
+            data={'message': feedback_text}
+        )
+        if response.ok:
+            st.success("Thank you for your feedback! It has been sent successfully.")
+        else:
+            st.error("There was an issue sending your feedback. Please try again later.")
 
 # Display current session state
 st.sidebar.title("Debug Information")
